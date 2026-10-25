@@ -95,6 +95,9 @@ function initializeTables() {
   pool.query(`
     CREATE TABLE IF NOT EXISTS messages (
       id INT AUTO_INCREMENT PRIMARY KEY,
+      chat_type ENUM('group', 'direct', 'multi') DEFAULT 'group',
+      recipient_id INT DEFAULT NULL,
+      recipient_ids VARCHAR(255) DEFAULT NULL,
       sender_id INT NOT NULL,
       sender_name VARCHAR(150) NOT NULL,
       sender_email VARCHAR(150) NOT NULL,
@@ -106,12 +109,17 @@ function initializeTables() {
       target_audience VARCHAR(255) DEFAULT 'all',
       is_pinned TINYINT(1) DEFAULT 0,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX(chat_type),
+      INDEX(recipient_id),
       INDEX(sender_id),
       INDEX(created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `, (err) => {
     if (err) console.error("Error creating messages table:", err);
-    else seedWelcomeMessage();
+    else {
+      runMigrations();
+      seedWelcomeMessage();
+    }
   });
 
   // 3. Message Reads Table (for missed/unread notification counter)
@@ -200,6 +208,37 @@ function seedWelcomeMessage() {
         console.log('✅ Welcome message seeded.');
       });
     }
+  });
+}
+
+function runMigrations() {
+  const migrations = [
+    {
+      col: 'chat_type',
+      sql: "ALTER TABLE messages ADD COLUMN chat_type ENUM('group', 'direct', 'multi') DEFAULT 'group' AFTER id, ADD INDEX (chat_type)"
+    },
+    {
+      col: 'recipient_id',
+      sql: "ALTER TABLE messages ADD COLUMN recipient_id INT DEFAULT NULL AFTER chat_type, ADD INDEX (recipient_id)"
+    },
+    {
+      col: 'recipient_ids',
+      sql: "ALTER TABLE messages ADD COLUMN recipient_ids VARCHAR(255) DEFAULT NULL AFTER recipient_id"
+    }
+  ];
+
+  migrations.forEach(({ col, sql }) => {
+    pool.query(`
+      SELECT COUNT(*) AS cnt 
+      FROM INFORMATION_SCHEMA.COLUMNS 
+      WHERE TABLE_SCHEMA = 'group_pchat' AND TABLE_NAME = 'messages' AND COLUMN_NAME = ?
+    `, [col], (err, rows) => {
+      if (!err && rows && rows[0].cnt === 0) {
+        pool.query(sql, (aErr) => {
+          if (!aErr) console.log(`✅ Database migration: added column ${col} to messages table.`);
+        });
+      }
+    });
   });
 }
 

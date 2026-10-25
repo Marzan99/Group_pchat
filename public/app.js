@@ -1,5 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════
 // PARAMOUNT GROUP PCHAT — CLIENT APPLICATION
+// Real-Time Group & Direct 1-on-1 Private Messaging Platform
+// Designed & Developed by Marzan
 // ═══════════════════════════════════════════════════════════════════
 
 const API_BASE = ''; // Same origin
@@ -8,25 +10,53 @@ let socket = null;
 // Application State
 const state = {
   currentUser: JSON.parse(localStorage.getItem('group_pchat_user') || 'null'),
+  
+  // Active Conversation: { type: 'group' } OR { type: 'direct', partner_id, partner_name, ... }
+  activeChat: {
+    type: 'group',
+    id: 'group',
+    name: 'Paramount Corporate Group',
+  },
+
+  conversations: {
+    group: {
+      id: 'group',
+      type: 'group',
+      name: 'Paramount Corporate Group',
+      last_message: null,
+      last_message_time: null,
+      unread_count: 0,
+    },
+    direct_chats: [],
+  },
+
   messages: [],
   users: [],
   onlineUserIds: [],
   unreadCount: 0,
   unreadNotifications: [],
+
   groupSettings: {
     group_name: 'Paramount Corporate Group',
     group_description: 'Official Group Chat for Paramount Insurance Ltd.',
     only_admins_can_send: '0',
     announcement: ''
   },
+
   replyingTo: null,
-  activeSidebarTab: 'chat', // 'chat' | 'members'
+  activeSidebarTab: 'chats', // 'chats' | 'members'
   showNotifDropdown: false,
   showAdminModal: false,
   adminModalTab: 'permissions', // 'permissions' | 'settings'
   showAudienceModal: false,
   targetAudience: 'all', // 'all' or comma-separated user IDs
   targetAudienceSelectedIds: [],
+  
+  // Multi-user private message modal
+  showMultiUserModal: false,
+  multiUserSelectedIds: [],
+  multiUserMessageText: '',
+
   searchQuery: '',
   typingUsers: new Map(), // userId -> name
   soundEnabled: true,
@@ -55,7 +85,7 @@ function playNotificationSound() {
     osc.start();
     osc.stop(audioCtx.currentTime + 0.25);
   } catch (e) {
-    // Audio not allowed yet or not supported
+    // Audio context allowed after user interaction
   }
 }
 
@@ -90,15 +120,32 @@ function setupSocket() {
   });
 
   socket.on('new_message', (msg) => {
-    // Check if not already added
-    if (!state.messages.some(m => m.id === msg.id)) {
-      state.messages.push(msg);
-      if (msg.sender_id !== state.currentUser.id) {
-        playNotificationSound();
+    const isForActiveChat = 
+      (state.activeChat.type === 'group' && (msg.chat_type === 'group' || !msg.chat_type)) ||
+      (state.activeChat.type === 'direct' && msg.chat_type === 'direct' && 
+        ((msg.sender_id === state.activeChat.partner_id && msg.recipient_id === state.currentUser.id) ||
+         (msg.sender_id === state.currentUser.id && msg.recipient_id === state.activeChat.partner_id))
+      ) ||
+      (state.activeChat.type === 'multi' && msg.chat_type === 'multi');
+
+    if (isForActiveChat) {
+      if (!state.messages.some(m => m.id === msg.id)) {
+        state.messages.push(msg);
+        render();
+        scrollToBottom();
       }
-      render();
-      scrollToBottom();
     }
+
+    if (msg.sender_id !== state.currentUser.id) {
+      playNotificationSound();
+    }
+
+    // Refresh conversation previews and unread indicators
+    fetchConversations();
+  });
+
+  socket.on('direct_conversation_updated', () => {
+    fetchConversations();
   });
 
   socket.on('unread_count_updated', ({ unreadCount }) => {
@@ -106,14 +153,21 @@ function setupSocket() {
     renderHeaderBadges();
   });
 
-  socket.on('user_typing', ({ userId, name, isTyping }) => {
+  socket.on('user_typing', ({ userId, name, isTyping, chatType, partnerId }) => {
     if (userId === state.currentUser.id) return;
-    if (isTyping) {
-      state.typingUsers.set(userId, name);
-    } else {
-      state.typingUsers.delete(userId);
+
+    const matchesChat = 
+      (state.activeChat.type === 'group' && chatType === 'group') ||
+      (state.activeChat.type === 'direct' && chatType === 'direct' && partnerId === state.currentUser.id);
+
+    if (matchesChat) {
+      if (isTyping) {
+        state.typingUsers.set(userId, name);
+      } else {
+        state.typingUsers.delete(userId);
+      }
+      renderTypingBar();
     }
-    renderTypingBar();
   });
 
   socket.on('permissions_updated', ({ userId, can_send, role }) => {
@@ -123,7 +177,6 @@ function setupSocket() {
       localStorage.setItem('group_pchat_user', JSON.stringify(state.currentUser));
       render();
     }
-    // Update local users list if loaded
     const u = state.users.find(x => x.id === userId);
     if (u) {
       if (can_send !== undefined) u.can_send = can_send;
@@ -150,13 +203,13 @@ function setupSocket() {
 }
 
 // ─────────────────────────────────────────────
-// Initial Data Fetching
+// Data Fetching
 // ─────────────────────────────────────────────
 async function initChat() {
   setupSocket();
 
   try {
-    // 1. Fetch Users
+    // 1. Fetch Users List
     const usersRes = await fetch(`${API_BASE}/api/users`);
     state.users = await usersRes.json();
 
@@ -164,15 +217,14 @@ async function initChat() {
     const setRes = await fetch(`${API_BASE}/api/settings`);
     state.groupSettings = await setRes.json();
 
-    // 3. Fetch Messages
-    const msgRes = await fetch(`${API_BASE}/api/messages?user_id=${state.currentUser.id}`);
-    state.messages = await msgRes.json();
+    // 3. Fetch Conversations list
+    await fetchConversations();
 
-    // 4. Fetch Unread Notifications
-    const notifRes = await fetch(`${API_BASE}/api/notifications/unread?user_id=${state.currentUser.id}`);
-    const notifData = await notifRes.json();
-    state.unreadCount = notifData.count;
-    state.unreadNotifications = notifData.unreadMessages;
+    // 4. Fetch Messages for default active chat (Group)
+    await loadActiveChatMessages();
+
+    // 5. Fetch Missed Notifications
+    fetchMissedNotifications();
 
     render();
     scrollToBottom();
@@ -181,9 +233,86 @@ async function initChat() {
   }
 }
 
+async function fetchConversations() {
+  if (!state.currentUser) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/conversations?user_id=${state.currentUser.id}`);
+    const data = await res.json();
+    state.conversations = data;
+    render();
+  } catch (e) {
+    console.error('Error fetching conversations:', e);
+  }
+}
+
+async function loadActiveChatMessages() {
+  if (!state.currentUser) return;
+
+  try {
+    let url = `${API_BASE}/api/messages?user_id=${state.currentUser.id}&chat_type=${state.activeChat.type}`;
+    if (state.activeChat.type === 'direct') {
+      url += `&partner_id=${state.activeChat.partner_id}`;
+    }
+
+    const res = await fetch(url);
+    state.messages = await res.json();
+
+    // Refresh conversation unread count
+    fetchConversations();
+    fetchMissedNotifications();
+    render();
+    scrollToBottom();
+  } catch (err) {
+    console.error('Error loading chat messages:', err);
+  }
+}
+
+async function fetchMissedNotifications() {
+  if (!state.currentUser) return;
+  try {
+    const notifRes = await fetch(`${API_BASE}/api/notifications/unread?user_id=${state.currentUser.id}`);
+    const notifData = await notifRes.json();
+    state.unreadCount = notifData.count;
+    state.unreadNotifications = notifData.unreadMessages;
+    renderHeaderBadges();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
 // ─────────────────────────────────────────────
-// Actions
+// Actions & Handlers
 // ─────────────────────────────────────────────
+
+// Switch Chat (Group vs Direct 1-on-1)
+function switchChat(chatObj) {
+  state.activeChat = chatObj;
+  state.replyingTo = null;
+  state.typingUsers.clear();
+  loadActiveChatMessages();
+}
+
+// Start 1-on-1 Direct Chat with any member
+function startDirectChatWithUser(user) {
+  if (user.id === state.currentUser.id) {
+    alert('নিজের সাথে আলাদা চ্যাট খোলা যাবে না। অন্য কোনো সদস্য নির্বাচন করুন।');
+    return;
+  }
+
+  state.activeChat = {
+    type: 'direct',
+    id: `direct_${user.id}`,
+    partner_id: user.id,
+    partner_name: user.name,
+    partner_email: user.email,
+    partner_department: user.department,
+    partner_role: user.role,
+    partner_avatar: user.avatar_color,
+  };
+
+  state.activeSidebarTab = 'chats';
+  loadActiveChatMessages();
+}
 
 // Login
 async function handleLogin(e) {
@@ -247,7 +376,7 @@ function handleLogout() {
   renderLogin();
 }
 
-// Send Message
+// Send Message (Group OR Direct 1-on-1)
 async function handleSendMessage(e) {
   if (e) e.preventDefault();
 
@@ -260,8 +389,10 @@ async function handleSendMessage(e) {
   const payload = {
     sender_id: state.currentUser.id,
     message: text,
+    chat_type: state.activeChat.type,
+    recipient_id: state.activeChat.type === 'direct' ? state.activeChat.partner_id : null,
+    target_audience: state.activeChat.type === 'group' ? (state.targetAudience || 'all') : null,
     reply_to_id: state.replyingTo ? state.replyingTo.id : null,
-    target_audience: state.targetAudience || 'all',
   };
 
   try {
@@ -277,9 +408,14 @@ async function handleSendMessage(e) {
       inputEl.value = '';
       state.replyingTo = null;
       renderFooterCompose();
-      // Inform typing stopped
       if (socket) {
-        socket.emit('typing', { userId: state.currentUser.id, name: state.currentUser.name, isTyping: false });
+        socket.emit('typing', { 
+          userId: state.currentUser.id, 
+          name: state.currentUser.name, 
+          isTyping: false,
+          chatType: state.activeChat.type,
+          partnerId: state.activeChat.type === 'direct' ? state.activeChat.partner_id : null,
+        });
       }
     } else {
       alert(data.error || 'মেসেজ পাঠানো সম্ভব হয়নি।');
@@ -287,6 +423,44 @@ async function handleSendMessage(e) {
   } catch (err) {
     console.error('Send error:', err);
     alert('নেটওয়ার্ক সমস্যা।');
+  }
+}
+
+// Send Multi-User Private Message
+async function handleSendMultiUserMessage() {
+  if (state.multiUserSelectedIds.length === 0) {
+    alert('অন্তত একজন বা একাধিক প্রাপক নির্বাচন করুন।');
+    return;
+  }
+
+  const text = document.getElementById('multi-message-text').value.trim();
+  if (!text) {
+    alert('মেসেজ টেক্সট লিখুন।');
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/api/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sender_id: state.currentUser.id,
+        message: text,
+        chat_type: 'multi',
+        recipient_ids: state.multiUserSelectedIds,
+      }),
+    });
+
+    const data = await res.json();
+    if (res.ok && data.success) {
+      alert(`✅ সফলভাবে ${state.multiUserSelectedIds.length} জন নির্বাচিত ইউজারের কাছে মেসেজ পাঠানো হয়েছে!`);
+      closeMultiUserModal();
+      fetchConversations();
+    } else {
+      alert(data.error || 'পাঠানো সম্ভব হয়নি।');
+    }
+  } catch (e) {
+    console.error(e);
   }
 }
 
@@ -302,6 +476,7 @@ async function markAllNotificationsAsRead() {
     state.unreadCount = 0;
     state.unreadNotifications = [];
     state.showNotifDropdown = false;
+    fetchConversations();
     render();
   } catch (err) {
     console.error(err);
@@ -334,7 +509,7 @@ async function togglePinMessage(msgId, currentPin) {
 
 // Delete Message (Admin/IT)
 async function deleteMessage(msgId) {
-  if (!confirm('আপনি কি এই মেসেজটি গ্রুপ থেকে মুছে ফেলতে চান?')) return;
+  if (!confirm('আপনি কি এই মেসেজটি মুছে ফেলতে চান?')) return;
   try {
     await fetch(`${API_BASE}/api/messages/${msgId}?user_id=${state.currentUser.id}`, {
       method: 'DELETE',
@@ -418,7 +593,6 @@ async function saveGroupSettings() {
   }
 }
 
-// Scroll to bottom helper
 function scrollToBottom() {
   setTimeout(() => {
     const container = document.getElementById('messages-container');
@@ -440,7 +614,7 @@ function renderLogin() {
       <div class="login-card">
         <div class="login-logo">💬</div>
         <h2 class="login-title">Paramount Group PChat</h2>
-        <p class="login-subtitle">Paramount Insurance Company Ltd. • Corporate Real-Time Messaging</p>
+        <p class="login-subtitle">Paramount Insurance Company Ltd. • Group & 1-on-1 Real-Time Chat</p>
 
         <div id="login-error" class="login-error" style="display: none;"></div>
 
@@ -498,12 +672,18 @@ function render() {
 
   const isAdminOrIt = state.currentUser.role === 'admin' || state.currentUser.role === 'it';
   const onlineCount = state.onlineUserIds.length;
-  const pinnedMessage = state.messages.find(m => m.is_pinned === 1);
+  const isDirect = state.activeChat.type === 'direct';
+  const pinnedMessage = (!isDirect) ? state.messages.find(m => m.is_pinned === 1) : null;
 
   // Group restricted check
   const isGroupLocked = state.groupSettings.only_admins_can_send === '1';
   const isMuted = !state.currentUser.can_send && !isAdminOrIt;
-  const cannotSend = isMuted || (isGroupLocked && !isAdminOrIt);
+  const cannotSendInGroup = !isDirect && (isMuted || (isGroupLocked && !isAdminOrIt));
+  const cannotSendInDirect = isDirect && isMuted;
+
+  // Partner info if in direct chat
+  const partnerUser = isDirect ? state.users.find(u => u.id === state.activeChat.partner_id) : null;
+  const isPartnerOnline = isDirect && state.onlineUserIds.includes(state.activeChat.partner_id);
 
   app.innerHTML = `
     <div class="app-container">
@@ -547,6 +727,16 @@ function render() {
           </div>
         </div>
 
+        <!-- Quick Action Buttons: Multi-user Message -->
+        <div class="quick-action-bar">
+          <button class="quick-action-btn" onclick="openMultiUserModal()" title="একাধিক ইউজারকে প্রাইভেট মেসেজ পাঠান">
+            👥 মাল্টিপল মেসেজ
+          </button>
+          <button class="quick-action-btn" onclick="switchSidebarTab('members')" title="নতুন কারও সাথে ১-অন-১ চ্যাট শুরু করুন">
+            ➕ নতুন প্রাইভেট চ্যাট
+          </button>
+        </div>
+
         <!-- Search Bar -->
         <div class="sidebar-search-box">
           <div class="search-input-wrapper">
@@ -554,7 +744,7 @@ function render() {
             <input 
               type="text" 
               class="search-input" 
-              placeholder="Search in group or members..." 
+              placeholder="Search conversation or member..." 
               value="${escapeHTML(state.searchQuery)}"
               oninput="handleSearch(this.value)"
             />
@@ -564,22 +754,22 @@ function render() {
         <!-- Sidebar Navigation Tabs -->
         <div class="sidebar-tabs">
           <button 
-            class="sidebar-tab-btn ${state.activeSidebarTab === 'chat' ? 'active' : ''}" 
-            onclick="switchSidebarTab('chat')"
+            class="sidebar-tab-btn ${state.activeSidebarTab === 'chats' ? 'active' : ''}" 
+            onclick="switchSidebarTab('chats')"
           >
-            💬 গ্রুপ চ্যাট
+            💬 চ্যাট থ্রেডসমূহ
           </button>
           <button 
             class="sidebar-tab-btn ${state.activeSidebarTab === 'members' ? 'active' : ''}" 
             onclick="switchSidebarTab('members')"
           >
-            👥 মেম্বারস (${state.users.length})
+            👥 ৩৩ মেম্বারস ডিরেক্টরি
           </button>
         </div>
 
         <!-- Sidebar Content List -->
         <div class="sidebar-list">
-          ${state.activeSidebarTab === 'chat' ? renderGroupItemCard(onlineCount) : renderMembersList()}
+          ${state.activeSidebarTab === 'chats' ? renderChatsList() : renderMembersList()}
         </div>
 
         <!-- Sidebar Footer -->
@@ -593,17 +783,46 @@ function render() {
         <!-- Chat Header -->
         <div class="chat-header">
           <div class="chat-header-left">
-            <div class="group-avatar">PG</div>
-            <div class="chat-header-info">
-              <span class="chat-header-title">${escapeHTML(state.groupSettings.group_name)}</span>
-              <span class="chat-header-members">
-                <span class="online-dot"></span>
-                ৩৩টি ডিপার্টমেন্ট ও ব্রাঞ্চ • ${onlineCount} জন লাইভ একটিভ
-              </span>
-            </div>
+            ${isDirect ? `
+              <div class="avatar ${isPartnerOnline ? 'online' : ''}" style="background: ${state.activeChat.partner_avatar || '#0284c7'}; width: 44px; height: 44px; font-size: 18px;">
+                ${state.activeChat.partner_name.charAt(0).toUpperCase()}
+              </div>
+              <div class="chat-header-info">
+                <span class="chat-header-title">
+                  ${escapeHTML(state.activeChat.partner_name)}
+                  <span class="user-role-pill ${state.activeChat.partner_role}" style="font-size: 10px; margin-left: 6px;">
+                    ${state.activeChat.partner_role === 'admin' ? '👑 Admin' : state.activeChat.partner_role === 'it' ? '💻 IT' : '👤'}
+                  </span>
+                </span>
+                <span class="chat-header-members">
+                  <span class="online-dot" style="background: ${isPartnerOnline ? '#22c55e' : '#94a3b8'};"></span>
+                  ${isPartnerOnline ? 'Online এখন সক্রিয়' : 'Offline'} • ${escapeHTML(state.activeChat.partner_department || 'Branch')} (${escapeHTML(state.activeChat.partner_email || '')})
+                </span>
+              </div>
+            ` : `
+              <div class="group-avatar">PG</div>
+              <div class="chat-header-info">
+                <span class="chat-header-title">${escapeHTML(state.groupSettings.group_name)}</span>
+                <span class="chat-header-members">
+                  <span class="online-dot"></span>
+                  ৩৩টি ডিপার্টমেন্ট ও ব্রাঞ্চ • ${onlineCount} জন লাইভ একটিভ
+                </span>
+              </div>
+            `}
           </div>
 
           <div class="chat-header-actions">
+            ${isDirect ? `
+              <button 
+                class="quick-action-btn" 
+                onclick="switchChat({ type: 'group', id: 'group', name: state.groupSettings.group_name })"
+                title="মূল গ্রুপ চ্যাটে ফিরে যান"
+                style="padding: 6px 12px;"
+              >
+                ← গ্রুপ চ্যাটে যান
+              </button>
+            ` : ''}
+
             <button 
               class="icon-btn" 
               onclick="toggleSound()" 
@@ -614,7 +833,7 @@ function render() {
           </div>
         </div>
 
-        <!-- Pinned Notice Banner (If Any) -->
+        <!-- Pinned Notice Banner (If in Group and Pin exists) -->
         ${pinnedMessage ? `
           <div class="pinned-banner">
             <div>
@@ -642,14 +861,14 @@ function render() {
 
         <!-- Chat Footer Compose Box -->
         <div class="chat-footer" id="chat-footer">
-          ${cannotSend ? `
+          ${(cannotSendInGroup || cannotSendInDirect) ? `
             <div class="locked-group-banner">
               🚫 ${isMuted 
                 ? 'অ্যাডমিনিস্ট্রেটর আপনার মেসেজ পাঠানোর পারমিশন বন্ধ রেখেছেন।' 
                 : 'বর্তমানে শুধুমাত্র অ্যাডমিন ও আইটি সদস্যরা গ্রুপে মেসেজ দিতে পারবেন।'
               }
             </div>
-          ` : renderComposeArea(isAdminOrIt)}
+          ` : renderComposeArea(isAdminOrIt, isDirect)}
         </div>
       </div>
     </div>
@@ -657,72 +876,147 @@ function render() {
     <!-- Modals Container -->
     ${state.showAdminModal ? renderAdminModal() : ''}
     ${state.showAudienceModal ? renderAudienceModal() : ''}
+    ${state.showMultiUserModal ? renderMultiUserModal() : ''}
   `;
 
   renderTypingBar();
   bindInputEvents();
 }
 
-// 3. Render Group Item Card in Sidebar
-function renderGroupItemCard(onlineCount) {
-  const lastMsg = state.messages.length > 0 ? state.messages[state.messages.length - 1] : null;
+// 3. Render Chats List (Group + 1-on-1 Direct Chats)
+function renderChatsList() {
+  const isGroupActive = state.activeChat.type === 'group';
+  const groupData = state.conversations.group;
+  const directChats = state.conversations.direct_chats || [];
+
   return `
-    <div class="group-item-card" onclick="switchSidebarTab('chat')">
+    <!-- 1. Pinned Main Corporate Group -->
+    <div class="chat-section-title">
+      <span>📢 কর্পোরেট গ্রুপ চ্যাট</span>
+    </div>
+    <div 
+      class="group-item-card ${isGroupActive ? 'active' : ''}" 
+      onclick="switchChat({ type: 'group', id: 'group', name: state.groupSettings.group_name })"
+    >
       <div class="group-avatar">PG</div>
       <div class="group-item-details">
         <div class="group-item-header">
           <span class="group-item-title">${escapeHTML(state.groupSettings.group_name)}</span>
-          <span class="group-item-time">${lastMsg ? formatMessageTime(lastMsg.created_at) : ''}</span>
+          <span class="group-item-time">${groupData && groupData.last_message_time ? formatMessageTime(groupData.last_message_time) : ''}</span>
         </div>
         <div class="group-item-preview">
-          <span>${lastMsg ? `${escapeHTML(lastMsg.sender_name)}: ${escapeHTML(lastMsg.message.substring(0, 32))}...` : 'কোনো বার্তা নেই'}</span>
-          ${state.unreadCount > 0 ? `<span class="bell-badge" style="position: static;">${state.unreadCount}</span>` : ''}
+          <span>${groupData && groupData.last_message ? `${escapeHTML(groupData.last_sender_name || 'Member')}: ${escapeHTML(groupData.last_message.substring(0, 30))}...` : 'কোনো বার্তা নেই'}</span>
+          ${groupData && groupData.unread_count > 0 ? `<span class="bell-badge" style="position: static;">${groupData.unread_count}</span>` : ''}
         </div>
       </div>
     </div>
+
+    <!-- 2. Direct 1-on-1 Chats Section -->
+    <div class="chat-section-title" style="margin-top: 10px;">
+      <span>👤 ব্যক্তিগত চ্যাটসমূহ (${directChats.length})</span>
+      <span style="font-size: 10px; cursor: pointer; color: var(--wa-primary-dark);" onclick="switchSidebarTab('members')">
+        ➕ নতুন চ্যাট
+      </span>
+    </div>
+
+    ${directChats.length === 0 ? `
+      <div style="padding: 20px 16px; text-align: center; color: #94a3b8; font-size: 12.5px;">
+        এখনো কোনো ব্যক্তিগত চ্যাট শুরু করেননি。<br/>
+        <button class="quick-action-btn" style="margin: 10px auto 0;" onclick="switchSidebarTab('members')">
+          ➕ মেম্বারদের তালিকা থেকে শুরু করুন
+        </button>
+      </div>
+    ` : directChats.map(c => {
+      const isChatActive = state.activeChat.type === 'direct' && state.activeChat.partner_id === c.partner_id;
+      const isOnline = state.onlineUserIds.includes(c.partner_id);
+
+      return `
+        <div 
+          class="chat-item-card ${isChatActive ? 'active' : ''}" 
+          onclick='switchChat({
+            type: "direct",
+            id: "direct_${c.partner_id}",
+            partner_id: ${c.partner_id},
+            partner_name: "${escapeHTML(c.name)}",
+            partner_email: "${escapeHTML(c.email)}",
+            partner_department: "${escapeHTML(c.department)}",
+            partner_role: "${c.role}",
+            partner_avatar: "${c.avatar_color}"
+          })'
+        >
+          <div class="avatar ${isOnline ? 'online' : ''}" style="background: ${c.avatar_color || '#0284c7'}; width: 44px; height: 44px; font-size: 16px;">
+            ${c.name.charAt(0).toUpperCase()}
+          </div>
+          <div class="group-item-details">
+            <div class="group-item-header">
+              <span class="group-item-title">${escapeHTML(c.name)}</span>
+              <span class="group-item-time">${c.last_message_time ? formatMessageTime(c.last_message_time) : ''}</span>
+            </div>
+            <div class="group-item-preview">
+              <span>${c.last_message ? escapeHTML(c.last_message.substring(0, 32)) + '...' : '(খালি চ্যাট)'}</span>
+              ${c.unread_count > 0 ? `<span class="bell-badge" style="position: static;">${c.unread_count}</span>` : ''}
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('')}
   `;
 }
 
 // 4. Render Members List in Sidebar
 function renderMembersList() {
   const filtered = state.users.filter(u => 
-    u.name.toLowerCase().includes(state.searchQuery.toLowerCase()) ||
-    u.email.toLowerCase().includes(state.searchQuery.toLowerCase()) ||
-    u.department.toLowerCase().includes(state.searchQuery.toLowerCase())
+    u.id !== state.currentUser.id &&
+    (u.name.toLowerCase().includes(state.searchQuery.toLowerCase()) ||
+     u.email.toLowerCase().includes(state.searchQuery.toLowerCase()) ||
+     u.department.toLowerCase().includes(state.searchQuery.toLowerCase()))
   );
 
-  return filtered.map(u => {
-    const isOnline = state.onlineUserIds.includes(u.id);
-    return `
-      <div class="member-row">
-        <div class="member-left">
-          <div class="avatar ${isOnline ? 'online' : ''}" style="background: ${u.avatar_color || '#0284c7'}; width: 36px; height: 36px; font-size: 14px;">
-            ${u.name.charAt(0).toUpperCase()}
+  return `
+    <div class="chat-section-title">
+      <span>কোম্পানির ৩৩ জন সদস্য (১ ক্লিকে ব্যক্তিগত চ্যাট শুরু করুন)</span>
+    </div>
+    ${filtered.map(u => {
+      const isOnline = state.onlineUserIds.includes(u.id);
+      return `
+        <div class="member-row" onclick='startDirectChatWithUser(${JSON.stringify(u)})' style="cursor: pointer;">
+          <div class="member-left">
+            <div class="avatar ${isOnline ? 'online' : ''}" style="background: ${u.avatar_color || '#0284c7'}; width: 38px; height: 38px; font-size: 15px;">
+              ${u.name.charAt(0).toUpperCase()}
+            </div>
+            <div class="member-details">
+              <div class="member-name">${escapeHTML(u.name)}</div>
+              <div class="member-sub">${escapeHTML(u.department)} • ${u.email}</div>
+            </div>
           </div>
-          <div class="member-details">
-            <div class="member-name">${escapeHTML(u.name)}</div>
-            <div class="member-sub">${escapeHTML(u.department)} • ${u.email}</div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <span class="user-role-pill ${u.role}">
+              ${u.role === 'admin' ? '👑 Admin' : u.role === 'it' ? '💻 IT' : '👤'}
+            </span>
+            <button class="quick-action-btn" style="padding: 4px 8px; font-size: 11px;">
+              💬 চ্যাট
+            </button>
           </div>
         </div>
-        <div>
-          ${!u.can_send ? `<span title="Muted / Cannot send" style="font-size: 13px;">🚫</span>` : ''}
-          <span class="user-role-pill ${u.role}">
-            ${u.role === 'admin' ? '👑 Admin' : u.role === 'it' ? '💻 IT' : '👤'}
-          </span>
-        </div>
-      </div>
-    `;
-  }).join('');
+      `;
+    }).join('')}
+  `;
 }
 
 // 5. Render Messages Feed
 function renderMessages() {
+  const isDirect = state.activeChat.type === 'direct';
+
   if (state.messages.length === 0) {
     return `
       <div style="text-align: center; padding: 60px 0; color: #8696a0;">
         <div style="font-size: 48px; margin-bottom: 12px;">💬</div>
-        <h4 style="margin-bottom: 6px; color: #475569;">গ্রুপে কোনো বার্তা নেই</h4>
-        <p style="font-size: 13px;">প্রথম মেসেজটি পাঠিয়ে সবার সাথে কথোপকথন শুরু করুন!</p>
+        <h4 style="margin-bottom: 6px; color: #475569;">
+          ${isDirect ? `🔒 ${escapeHTML(state.activeChat.partner_name)}-এর সাথে ব্যক্তিগত চ্যাট` : 'গ্রুপে কোনো বার্তা নেই'}
+        </h4>
+        <p style="font-size: 13px;">
+          ${isDirect ? 'এই কথোপকথনটি সম্পূর্ণ ব্যক্তিগত এবং এনক্রিপ্টেড ডাটাবেসে সংরক্ষিত।' : 'প্রথম মেসেজটি পাঠিয়ে সবার সাথে কথোপকথন শুরু করুন!'}
+        </p>
       </div>
     `;
   }
@@ -748,6 +1042,7 @@ function renderMessages() {
 
     const hasReply = msg.reply_to_text;
     const isTargeted = msg.target_audience && msg.target_audience !== 'all';
+    const isDirectMsg = msg.chat_type === 'direct';
 
     return `
       ${dateDividerHtml}
@@ -758,10 +1053,12 @@ function renderMessages() {
             <button class="bubble-action-btn" onclick='setReplyMessage(${JSON.stringify(msg)})' title="রিপ্লাই দিন (Reply)">
               ↩
             </button>
-            ${isAdminOrIt ? `
+            ${isAdminOrIt && !isDirectMsg ? `
               <button class="bubble-action-btn" onclick="togglePinMessage(${msg.id}, ${msg.is_pinned === 1})" title="${msg.is_pinned === 1 ? 'আনপিন করুন' : 'পিন করুন'}">
                 📌
               </button>
+            ` : ''}
+            ${isAdminOrIt ? `
               <button class="bubble-action-btn delete" onclick="deleteMessage(${msg.id})" title="ডিলিট করুন">
                 🗑️
               </button>
@@ -774,6 +1071,7 @@ function renderMessages() {
               <span>${escapeHTML(msg.sender_name)}</span>
               ${msg.sender_role === 'admin' ? '<span class="badge-tag admin">👑 Admin</span>' : ''}
               ${msg.sender_role === 'it' ? '<span class="badge-tag it">💻 IT</span>' : ''}
+              ${isDirectMsg ? '<span class="badge-tag" style="background: #e0f2fe; color: #0369a1;">🔒 Private</span>' : ''}
             </div>
           ` : ''}
 
@@ -785,8 +1083,8 @@ function renderMessages() {
             </div>
           ` : ''}
 
-          <!-- Targeted Audience Badge (if Admin sent to specific members) -->
-          ${isTargeted ? `
+          <!-- Targeted Audience Badge (if Admin sent to specific members in group) -->
+          ${isTargeted && !isDirectMsg ? `
             <div class="targeted-badge">
               🔒 নির্দিষ্ট সদস্যদের জন্য
             </div>
@@ -807,7 +1105,7 @@ function renderMessages() {
 }
 
 // 6. Render Compose Area
-function renderComposeArea(isAdminOrIt) {
+function renderComposeArea(isAdminOrIt, isDirect) {
   const targetLabel = state.targetAudience === 'all' 
     ? '📢 সকল সদস্য (All 33 Users)' 
     : `🔒 নির্দিষ্ট ইউজার (${state.targetAudienceSelectedIds.length} জন নির্বাচিত)`;
@@ -824,8 +1122,8 @@ function renderComposeArea(isAdminOrIt) {
       </div>
     ` : ''}
 
-    <!-- Admin/IT Audience Control Pill -->
-    ${isAdminOrIt ? `
+    <!-- Admin/IT Audience Control Pill (Only in Group Chat) -->
+    ${isAdminOrIt && !isDirect ? `
       <div class="audience-selector-bar">
         <span style="color: #64748b; font-weight: 600;">মেসেজ প্রাপক:</span>
         <button class="audience-pill-btn ${state.targetAudience !== 'all' ? 'active' : ''}" onclick="openAudienceModal()">
@@ -839,7 +1137,7 @@ function renderComposeArea(isAdminOrIt) {
       <textarea 
         id="chat-input" 
         class="chat-textarea" 
-        placeholder="একটি বার্তা লিখুন... (Enter চাপলে সেন্ড হবে, Shift+Enter নতুন লাইন)"
+        placeholder="${isDirect ? `🔒 ${escapeHTML(state.activeChat.partner_name)}-কে ব্যক্তিগত মেসেজ লিখুন...` : 'একটি গ্রুপ বার্তা লিখুন... (Enter চাপলে সেন্ড হবে)'}"
         rows="1"
       ></textarea>
       <button class="send-btn" onclick="handleSendMessage()" title="Send Message">
@@ -866,9 +1164,9 @@ function renderNotificationPopover() {
         ${state.unreadNotifications.length === 0 ? `
           <div class="notif-empty">কোনো অপঠিত মেসেজ নেই ✅</div>
         ` : state.unreadNotifications.map(n => `
-          <div class="notif-item" onclick="scrollToMessage(${n.id}); markAllNotificationsAsRead();">
+          <div class="notif-item" onclick="openNotifChat(${JSON.stringify(n).replace(/"/g, '&quot;')})">
             <div class="notif-item-sender">
-              <span>${escapeHTML(n.sender_name)}</span>
+              <span>${escapeHTML(n.sender_name)} ${n.chat_type === 'direct' ? '<span style="color: #0284c7; font-size: 10px;">[🔒 Direct]</span>' : ''}</span>
               <span class="notif-item-time">${formatMessageTime(n.created_at)}</span>
             </div>
             <div class="notif-item-text">${escapeHTML(n.message)}</div>
@@ -877,6 +1175,19 @@ function renderNotificationPopover() {
       </div>
     </div>
   `;
+}
+
+// Open notification message in correct chat
+function openNotifChat(notif) {
+  state.showNotifDropdown = false;
+  if (notif.chat_type === 'direct') {
+    const partner = state.users.find(u => u.id === notif.sender_id);
+    if (partner) {
+      startDirectChatWithUser(partner);
+      return;
+    }
+  }
+  switchChat({ type: 'group', id: 'group', name: state.groupSettings.group_name });
 }
 
 // 8. Render Admin / IT Control Panel Modal
@@ -1043,6 +1354,57 @@ function renderAudienceModal() {
   `;
 }
 
+// 10. Render Multi-User Private Message Modal
+function renderMultiUserModal() {
+  return `
+    <div class="modal-overlay" onclick="if(event.target === this) closeMultiUserModal()">
+      <div class="modal-card" style="max-width: 560px;">
+        <div class="modal-header">
+          <h3>👥 মাল্টিপল ইউজার প্রাইভেট মেসেজ ব্রডকাস্ট</h3>
+          <button class="modal-close-btn" onclick="closeMultiUserModal()">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">
+            যাদের যাদের কাছে এই বার্তা পাঠাতে চান, তাদের টিক দিন (বাকি ইউজাররা দেখতে পাবে না):
+          </p>
+
+          <div class="audience-checklist" style="max-height: 220px;">
+            ${state.users.filter(u => u.id !== state.currentUser.id).map(u => {
+              const isChecked = state.multiUserSelectedIds.includes(u.id);
+              return `
+                <label class="audience-check-item ${isChecked ? 'selected' : ''}">
+                  <input 
+                    type="checkbox" 
+                    value="${u.id}" 
+                    ${isChecked ? 'checked' : ''}
+                    onchange="toggleMultiUser(${u.id}, this.checked)"
+                  />
+                  <span>${escapeHTML(u.name)}</span>
+                </label>
+              `;
+            }).join('')}
+          </div>
+
+          <div class="form-group" style="margin-top: 14px;">
+            <label class="form-label">আপনার বার্তা লিখুন:</label>
+            <textarea 
+              id="multi-message-text" 
+              class="form-input" 
+              rows="3" 
+              placeholder="নির্বাচিত ইউজারদের কাছে এই বার্তাটি সরাসরি চলে যাবে..."
+            ></textarea>
+          </div>
+
+          <button class="login-btn" onclick="handleSendMultiUserMessage()">
+            🚀 নির্বাচিত (${state.multiUserSelectedIds.length} জন) ইউজারের কাছে পাঠান
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 // ─────────────────────────────────────────────
 // UI Helpers & Event Bindings
 // ─────────────────────────────────────────────
@@ -1061,16 +1423,27 @@ function bindInputEvents() {
   });
 
   inputEl.addEventListener('input', () => {
-    // Auto-expand textarea
     inputEl.style.height = 'auto';
     inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
 
-    // Emit typing indicator
     if (socket) {
-      socket.emit('typing', { userId: state.currentUser.id, name: state.currentUser.name, isTyping: true });
+      socket.emit('typing', { 
+        userId: state.currentUser.id, 
+        name: state.currentUser.name, 
+        isTyping: true,
+        chatType: state.activeChat.type,
+        partnerId: state.activeChat.type === 'direct' ? state.activeChat.partner_id : null,
+      });
+
       clearTimeout(typingTimeout);
       typingTimeout = setTimeout(() => {
-        socket.emit('typing', { userId: state.currentUser.id, name: state.currentUser.name, isTyping: false });
+        socket.emit('typing', { 
+          userId: state.currentUser.id, 
+          name: state.currentUser.name, 
+          isTyping: false,
+          chatType: state.activeChat.type,
+          partnerId: state.activeChat.type === 'direct' ? state.activeChat.partner_id : null,
+        });
       }, 2000);
     }
   });
@@ -1103,11 +1476,13 @@ function renderFooterCompose() {
   const footer = document.getElementById('chat-footer');
   if (!footer) return;
   const isAdminOrIt = state.currentUser.role === 'admin' || state.currentUser.role === 'it';
+  const isDirect = state.activeChat.type === 'direct';
   const isGroupLocked = state.groupSettings.only_admins_can_send === '1';
   const isMuted = !state.currentUser.can_send && !isAdminOrIt;
-  const cannotSend = isMuted || (isGroupLocked && !isAdminOrIt);
+  const cannotSendInGroup = !isDirect && (isMuted || (isGroupLocked && !isAdminOrIt));
+  const cannotSendInDirect = isDirect && isMuted;
 
-  if (cannotSend) {
+  if (cannotSendInGroup || cannotSendInDirect) {
     footer.innerHTML = `
       <div class="locked-group-banner">
         🚫 ${isMuted 
@@ -1117,7 +1492,7 @@ function renderFooterCompose() {
       </div>
     `;
   } else {
-    footer.innerHTML = renderComposeArea(isAdminOrIt);
+    footer.innerHTML = renderComposeArea(isAdminOrIt, isDirect);
     bindInputEvents();
   }
 }
@@ -1191,6 +1566,32 @@ function applyAudienceSelection() {
   }
   state.showAudienceModal = false;
   render();
+}
+
+// Multi-user modal handlers
+function openMultiUserModal() {
+  state.showMultiUserModal = true;
+  render();
+}
+
+function closeMultiUserModal() {
+  state.showMultiUserModal = false;
+  state.multiUserSelectedIds = [];
+  render();
+}
+
+function toggleMultiUser(userId, checked) {
+  if (checked) {
+    if (!state.multiUserSelectedIds.includes(userId)) {
+      state.multiUserSelectedIds.push(userId);
+    }
+  } else {
+    state.multiUserSelectedIds = state.multiUserSelectedIds.filter(id => id !== userId);
+  }
+  const btn = document.querySelector('#app .modal-card button.login-btn');
+  if (btn) {
+    btn.innerText = `🚀 নির্বাচিত (${state.multiUserSelectedIds.length} জন) ইউজারের কাছে পাঠান`;
+  }
 }
 
 function cancelReply() {
